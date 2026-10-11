@@ -1,0 +1,133 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index bbfc6d440870..2e83d886899d 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -345,6 +345,8 @@
+ 334	common	rseq			__x64_sys_rseq
+ 424	common	pidfd_send_signal	__x64_sys_pidfd_send_signal
+ 434	common	pidfd_open		__x64_sys_pidfd_open
++435	common	send_message_call	__x64_sys_send_message_call
++436	common	get_message_call	__x64_sys_get_message_call
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/arch/x86/include/asm/syscalls.h b/arch/x86/include/asm/syscalls.h
+index 9fa979dd0d9d..e2bf970985f2 100644
+--- a/arch/x86/include/asm/syscalls.h
++++ b/arch/x86/include/asm/syscalls.h
+@@ -47,5 +47,10 @@ struct vm86_struct;
+ asmlinkage long sys_vm86old(struct vm86_struct __user *);
+ asmlinkage long sys_vm86(unsigned long, unsigned long);
+ 
++
++/*P1 Messaging System*/
++asmlinkage long send_message_call(char __user * msg, uid_t recipient_user);
++asmlinkage long get_message_call(char __user * msg, uid_t __user * sending_user);
++
+ #endif /* CONFIG_X86_32 */
+ #endif /* _ASM_X86_SYSCALLS_H */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 0a1cdee858de..8a2b20fcbe41 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -63,6 +63,10 @@
+ #include <linux/uidgid.h>
+ #include <linux/cred.h>
+ 
++/*P1 import*/
++#include <linux/list.h>
++
++
+ #include <linux/nospec.h>
+ 
+ #include <linux/kmsg_dump.h>
+@@ -152,6 +156,89 @@ int fs_overflowgid = DEFAULT_FS_OVERFLOWGID;
+ EXPORT_SYMBOL(fs_overflowuid);
+ EXPORT_SYMBOL(fs_overflowgid);
+ 
++/*P1 Set and Get*/
++
++struct message_link{
++	char txt[1025];
++	uid_t recipient;
++	uid_t sender;
++
++	struct list_head list; // Chosen Data Structure.
++	// Ability to move up to first in to take out when get
++	// makes doubly linked list useful here.
++
++};
++// As our lizard overlords command
++// Doubly Linked List that will hold everything.
++static LIST_HEAD(SkySkink);
++
++SYSCALL_DEFINE2(send_message_call, char __user *, msg, uid_t, recipient_user){
++	//Make the struct
++	struct message_link *nmsg;
++	long result;
++	//Make space for the struct
++	nmsg = kmalloc(sizeof(*nmsg), GFP_KERNEL);
++	if(nmsg==NULL){
++		//If there is no memory, don't continue, or everything will probably fail and crash.
++		return -1;
++	}
++	//Put message in the new var
++	result = copy_from_user(nmsg->txt, msg, 1025);
++	if (result != 0){
++		//If we get anything other than 0, we failed.
++		//Free the space it was going to use.
++		kfree(nmsg);
++		//Spit out error.
++		return -1;
++	}
++
++	// Sender and Receiver now.
++	nmsg->recipient = recipient_user;
++	nmsg->sender = __kuid_val(current_uid());
++
++	list_add_tail(&nmsg->list, &SkySkink);
++
++	return 0;
++}
++SYSCALL_DEFINE2(get_message_call, char __user *, msg, uid_t __user *, sending_user){
++	struct message_link *pos;
++	uid_t recipientCheck = __kuid_val(current_uid());
++
++	list_for_each_entry(pos, &SkySkink, list){
++		//First instance closest to head with the right recipient id
++		if (pos->recipient == recipientCheck){
++			//Copy message
++			long result = copy_to_user(msg, pos->txt, 1025);
++
++			//Make sure didn't explode
++			if(result!=0){
++				//If it did, stop and return error.
++				return -1;
++			}
++
++			//Get sender
++			result = copy_to_user(sending_user, &pos->sender, sizeof(pos->sender));
++
++			//Make sure didn't explode
++			if(result!=0){
++				return -1;
++			}
++
++			//Delete message struct and free space.
++			list_del(&pos->list);
++			kfree(pos);
++
++			//Return Success
++			return 0;
++		}
++	}
++
++	//Nothing Found.
++	return 1;
++}
++
++
++
+ /*
+  * Returns true if current's euid is same as p's uid or euid,
+  * or has CAP_SYS_NICE to p's user_ns.
